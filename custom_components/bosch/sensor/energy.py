@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta, datetime
 from bosch_thermostat_client.const import UNITS
+from bosch_thermostat_client.exceptions import DeviceException
 from .statistic_helper import StatisticHelper
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
@@ -14,6 +15,7 @@ from homeassistant.const import (
 from homeassistant.util import dt as dt_util
 from homeassistant.components.recorder.models import (
     StatisticData,
+    StatisticMetaData,
     timestamp_to_datetime_or_none,
 )
 
@@ -30,13 +32,13 @@ EnergySensors = [
         "deviceClass": SensorDeviceClass.TEMPERATURE,
     },
     {
-        "name": "energy central heating",
+        "name": "energy central heating total",
         "attr": "CH",
         "unitOfMeasure": UnitOfEnergy.KILO_WATT_HOUR,
         "deviceClass": SensorDeviceClass.ENERGY,
     },
     {
-        "name": "energy hot water",
+        "name": "energy hot water total",
         "attr": "HW",
         "unitOfMeasure": UnitOfEnergy.KILO_WATT_HOUR,
         "deviceClass": SensorDeviceClass.ENERGY,
@@ -239,7 +241,11 @@ class EnergySensor(StatisticHelper):
         last_stat = await self.get_last_stat()
         if len(last_stat) == 0 or len(last_stat[self.statistic_id]) == 0:
             _LOGGER.debug("Last stats not exist. Trying to fetch ALL data.")
-            all_stats = list((await self._bosch_object.fetch_all()).values())
+            try:
+                all_stats = list((await self._bosch_object.fetch_all()).values())
+            except DeviceException as err:
+                _LOGGER.warning("Failed to fetch all energy stats: %s", err)
+                return
             if not all_stats:
                 _LOGGER.warn("Stats not found.")
                 return
@@ -274,7 +280,7 @@ class EnergySensor(StatisticHelper):
                 last_stats=last_stats, day=start_of_yesterday_utc
             )
             start_time = last_stats_row["start"]
-            _sum = last_stats_row["sum"] or 0
+            _sum = last_stats_row.get("sum") or 0
             if isinstance(start_time, float):
                 start_time = timestamp_to_datetime_or_none(start_time)
             if not start_time:
@@ -288,9 +294,13 @@ class EnergySensor(StatisticHelper):
                     start_time,
                     _sum,
                 )
-                bosch_data = await self.fetch_past_data(
-                    start_time=start_time, stop_time=yesterday
-                )
+                try:
+                    bosch_data = await self.fetch_past_data(
+                        start_time=start_time, stop_time=yesterday
+                    )
+                except DeviceException as err:
+                    _LOGGER.warning("Failed to fetch past energy data: %s", err)
+                    return [], _sum
                 return (
                     [
                         row
@@ -311,3 +321,110 @@ class EnergySensor(StatisticHelper):
         if self.statistic_id in last_stats:
             all_stats, _sum = await get_last_stats_from_bosch_api()
             self.append_statistics(stats=all_stats, sum=_sum)
+
+
+DailyEnergySensors = [
+    {
+        "name": "hot water yesterday energy",
+        "attr": "HW",
+        "unitOfMeasure": UnitOfEnergy.KILO_WATT_HOUR,
+        "deviceClass": SensorDeviceClass.ENERGY,
+    },
+    {
+        "name": "central heating yesterday energy",
+        "attr": "CH",
+        "unitOfMeasure": UnitOfEnergy.KILO_WATT_HOUR,
+        "deviceClass": SensorDeviceClass.ENERGY,
+    },
+]
+
+
+class DailyEnergySensor(EnergySensor):
+    """Sensor showing daily energy consumption as individual (non-cumulative) values."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, **kwargs) -> None:
+        """Initialize DailyEnergySensor with a unique ID suffix."""
+        super().__init__(**kwargs)
+        self._attr_unique_id = f"{self._attr_unique_id}daily"
+
+    @property
+    def statistic_id(self) -> str:
+        """External API statistic ID — separate from the cumulative energy sensor."""
+        if not self._short_id:
+            self._short_id = self.entity_id.replace(".", "").replace("sensor", "")
+        return (
+            f"{self._domain_name}:{self._attr_read_key}{self._short_id}daily".lower()
+        )
+
+    @property
+    def statistic_metadata(self):
+        """Metadata without cumulative sum — shows individual values on charts."""
+        return StatisticMetaData(
+            has_mean=True,
+            has_sum=False,
+            name=f"Stats {self._name}",
+            source=self._domain_name.lower(),
+            statistic_id=self.statistic_id,
+            unit_of_measurement=self._unit_of_measurement,
+        )
+
+    def append_statistics(self, stats, sum) -> float:
+        """Override to use full daily value instead of value/24."""
+        statistics_to_push = []
+        start_of_day = dt_util.start_of_local_day()
+        for stat in stats:
+            day_dt: datetime = datetime.strptime(stat["d"], "%d-%m-%Y")
+            _date = start_of_day.replace(
+                year=day_dt.year, month=day_dt.month, day=day_dt.day
+            )
+            _value = stat[self._attr_read_key]
+            _, statistics = self._generate_easycontrol_statistics(
+                start=_date,
+                end=_date + timedelta(days=1),
+                single_value=_value,
+                init_value=sum,
+            )
+            statistics_to_push += statistics
+        self.add_external_stats(stats=statistics_to_push)
+        return sum
+
+    async def _upsert_past_statistics(self, start: datetime, stop: datetime) -> None:
+        """Override to use full daily value instead of value/24."""
+        now = dt_util.now()
+        if now.day == start.day:
+            return
+        start_time = dt_util.start_of_local_day(start)
+        stats = await self.fetch_past_data(
+            start_time=start_time, stop_time=start + timedelta(hours=26)
+        )
+        _day_dt = start_time.strftime("%d-%m-%Y")
+        if not stats or _day_dt not in stats:
+            return
+        day_data = stats[_day_dt]
+        _value = day_data[self._attr_read_key]
+        _, statistics = self._generate_easycontrol_statistics(
+            start=start_time,
+            end=start_time + timedelta(days=1),
+            single_value=_value,
+            init_value=0,
+        )
+        self.add_external_stats(stats=statistics)
+
+    def _generate_easycontrol_statistics(
+        self, start: datetime, end: datetime, single_value: int, init_value: int
+    ) -> tuple[int, list[StatisticData]]:
+        """Generate hourly entries with mean=value, no cumulative sum."""
+        statistics = []
+        now = start
+        while now < end:
+            statistics.append(
+                StatisticData(
+                    start=now,
+                    mean=single_value,
+                    state=single_value,
+                )
+            )
+            now = now + timedelta(hours=1)
+        return (init_value, statistics)

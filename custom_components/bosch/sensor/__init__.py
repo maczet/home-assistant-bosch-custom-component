@@ -14,7 +14,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from ..const import CIRCUITS, DOMAIN, GATEWAY, SERVICE_MOVE_OLD_DATA, SIGNAL_BOSCH, UUID
 from .bosch import BoschSensor
 from .circuit import CircuitSensor
-from .energy import EcusRecordingSensors, EnergySensor, EnergySensors
+from .energy import DailyEnergySensor, DailyEnergySensors, EcusRecordingSensors, EnergySensor, EnergySensors
 from .notifications import NotificationSensor
 from .recording import RecordingSensor
 
@@ -84,6 +84,18 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                         is_enabled=sensor.attr_id in enabled_sensors,
                     )
                     for energy in EnergySensors
+                ] + [
+                    DailyEnergySensor(
+                        hass=hass,
+                        uuid=uuid,
+                        bosch_object=sensor,
+                        gateway=gateway,
+                        sensor_attributes=daily,
+                        attr_uri=sensor.attr_id,
+                        new_stats_api=new_stats_api,
+                        is_enabled=sensor.attr_id in enabled_sensors,
+                    )
+                    for daily in DailyEnergySensors
                 ],
             )
         elif sensor.kind == ECUS_RECORDING:

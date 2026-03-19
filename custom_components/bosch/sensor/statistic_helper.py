@@ -107,10 +107,34 @@ class StatisticHelper(BoschBaseSensor):
 
     def add_external_stats(self, stats: list[StatisticData]) -> None:
         """Add external statistics."""
-        self._state = -17
         if not stats:
+            _LOGGER.debug("add_external_stats called with empty stats for %s", self.statistic_id)
             return
+
+        _LOGGER.debug(
+            "add_external_stats for %s: %d entries, first=%s, last=%s",
+            self.statistic_id,
+            len(stats),
+            stats[0],
+            stats[-1],
+        )
         async_add_external_statistics(self.hass, self.statistic_metadata, stats)
+
+        latest_stat = stats[-1]
+        if isinstance(latest_stat, dict):
+            _sum = latest_stat.get("sum")
+            _state_val = latest_stat.get("state")
+        else:
+            _sum = latest_stat.sum
+            _state_val = latest_stat.state
+        self._state = _sum if _sum is not None else _state_val
+        _LOGGER.debug(
+            "add_external_stats updated state for %s: sum=%s, state=%s -> new_state=%s",
+            self.statistic_id,
+            _sum,
+            _state_val,
+            self._state,
+        )
         self.async_schedule_update_ha_state()
 
     def get_last_stats_before_date(
